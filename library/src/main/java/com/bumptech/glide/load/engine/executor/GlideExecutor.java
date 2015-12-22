@@ -1,10 +1,15 @@
 package com.bumptech.glide.load.engine.executor;
 
+import android.os.StrictMode;
+import android.os.StrictMode.ThreadPolicy;
 import android.support.annotation.NonNull;
 import android.util.Log;
 
 import java.io.File;
 import java.io.FilenameFilter;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -14,87 +19,144 @@ import java.util.regex.Pattern;
 /**
  * A prioritized {@link ThreadPoolExecutor} for running jobs in Glide.
  */
-public class GlideExecutor extends ThreadPoolExecutor {
+public final class GlideExecutor extends ThreadPoolExecutor {
+
+  /**
+   * The default thread name prefix for executors used to load/decode/transform data not found in
+   * cache.
+   */
+  public static final String DEFAULT_SOURCE_EXECUTOR_NAME = "source";
+  /**
+   * The default thread name prefix for executors used to load/decode/transform data found in
+   * Glide's cache.
+   */
+  public static final String DEFAULT_DISK_CACHE_EXECUTOR_NAME = "disk-cache";
+  /**
+   * The default thread count for executors used to load/decode/transform data found in Glide's
+   * cache.
+   */
+  public static final int DEFAULT_DISK_CACHE_EXECUTOR_THREADS = 1;
 
   private static final String TAG = "GlideExecutor";
-  private static final String DEFAULT_NAME = "fifo-pool";
   private static final String CPU_NAME_REGEX = "cpu[0-9]+";
   private static final String CPU_LOCATION = "/sys/devices/system/cpu/";
   // Don't use more than four threads when automatically determining thread count..
   private static final int MAXIMUM_AUTOMATIC_THREAD_COUNT = 4;
+  private final boolean executeSynchronously;
 
   /**
-   * Constructor to build a fixed thread pool with an automatically determined number of threads.
+   * Returns a new fixed thread pool with the default thread count returned from
+   * {@link #calculateBestThreadCount()}, the {@link #DEFAULT_DISK_CACHE_EXECUTOR_NAME} thread name
+   * prefix, and the
+   * {@link com.bumptech.glide.load.engine.executor.GlideExecutor.UncaughtThrowableStrategy#DEFAULT}
+   * uncaught throwable strategy.
    *
-   * @see #calculateBestThreadCount()
+   * <p>Disk cache executors do not allow network operations on their threads.
    */
-  public GlideExecutor() {
-    this(calculateBestThreadCount());
+  public static GlideExecutor newDiskCacheExecutor() {
+    return newDiskCacheExecutor(DEFAULT_DISK_CACHE_EXECUTOR_THREADS,
+        DEFAULT_DISK_CACHE_EXECUTOR_NAME, UncaughtThrowableStrategy.DEFAULT);
   }
 
   /**
-   * Constructor to build a fixed thread pool with the given pool size.
+   * Returns a new fixed thread pool with the given thread count, thread name prefix,
+   * and {@link com.bumptech.glide.load.engine.executor.GlideExecutor.UncaughtThrowableStrategy}.
    *
-   * @param poolSize The number of threads.
-   */
-  public GlideExecutor(int poolSize) {
-    this(poolSize, new DefaultThreadFactory());
-  }
-
-  /**
-   * Constructor to build a fixed thread pool with the given pool size.
+   * <p>Disk cache executors do not allow network operations on their threads.
    *
-   * @param poolSize The number of threads.
-   * @param uncaughtThrowableStrategy Dictates how the pool should handle uncaught and unexpected
-   *                                  throwables thrown by Futures run by the pool.
-   */
-  public GlideExecutor(int poolSize,
-      UncaughtThrowableStrategy uncaughtThrowableStrategy) {
-    this(poolSize, new DefaultThreadFactory(uncaughtThrowableStrategy));
-  }
-
-  /**
-   * Constructor to build a fixed thread pool with the given name and an automatically determined
-   * number of threads.
-   *
-   * @see #calculateBestThreadCount()
-   */
-  public GlideExecutor(String name) {
-    this(calculateBestThreadCount(), new DefaultThreadFactory(name));
-  }
-
-  /**
-   * Constructor to build a fixed thread pool with the given pool size.
-   *
-   * @param name The prefix for threads created by this pool.
-   * @param poolSize The number of threads.
-   */
-  public GlideExecutor(String name, int poolSize) {
-    this(poolSize, new DefaultThreadFactory(name));
-  }
-
-  /**
-   * Constructor to build a fixed thread pool with the given pool size.
-   *
+   * @param threadCount The number of threads.
    * @param name The prefix for each thread name.
-   * @param poolSize The number of threads.
    * @param uncaughtThrowableStrategy The {@link
    * com.bumptech.glide.load.engine.executor.GlideExecutor.UncaughtThrowableStrategy} to use to
    *                                  handle uncaught exceptions.
    */
-  public GlideExecutor(String name, int poolSize,
+  public static GlideExecutor newDiskCacheExecutor(int threadCount, String name,
       UncaughtThrowableStrategy uncaughtThrowableStrategy) {
-    this(poolSize, new DefaultThreadFactory(name, uncaughtThrowableStrategy));
+    return new GlideExecutor(threadCount, name, uncaughtThrowableStrategy,
+        true /*preventNetworkOperations*/, false /*executeSynchronously*/);
   }
 
-  private GlideExecutor(int corePoolSize, ThreadFactory threadFactory) {
+  /**
+   * Returns a new fixed thread pool with the default thread count returned from
+   * {@link #calculateBestThreadCount()}, the {@link #DEFAULT_SOURCE_EXECUTOR_NAME} thread name
+   * prefix, and the
+   * {@link com.bumptech.glide.load.engine.executor.GlideExecutor.UncaughtThrowableStrategy#DEFAULT}
+   * uncaught throwable strategy.
+   *
+   * <p>Source executors allow network operations on their threads.
+   */
+  public static GlideExecutor newSourceExecutor() {
+    return newSourceExecutor(calculateBestThreadCount(), DEFAULT_SOURCE_EXECUTOR_NAME,
+        UncaughtThrowableStrategy.DEFAULT);
+  }
+
+  /**
+   * Returns a new fixed thread pool with the given thread count, thread name prefix,
+   * and {@link com.bumptech.glide.load.engine.executor.GlideExecutor.UncaughtThrowableStrategy}.
+   *
+   * <p>Source executors allow network operations on their threads.
+   *
+   * @param threadCount The number of threads.
+   * @param name The prefix for each thread name.
+   * @param uncaughtThrowableStrategy The {@link
+   * com.bumptech.glide.load.engine.executor.GlideExecutor.UncaughtThrowableStrategy} to use to
+   *                                  handle uncaught exceptions.
+   */
+  public static GlideExecutor newSourceExecutor(int threadCount, String name,
+      UncaughtThrowableStrategy uncaughtThrowableStrategy) {
+    return new GlideExecutor(threadCount, name, uncaughtThrowableStrategy,
+        false /*preventNetworkOperations*/, false /*executeSynchronously*/);
+  }
+
+  // Visible for testing.
+  GlideExecutor(int poolSize, String name,
+      UncaughtThrowableStrategy uncaughtThrowableStrategy, boolean preventNetworkOperations,
+      boolean executeSynchronously) {
     super(
-        corePoolSize /*corePoolSize*/,
-        corePoolSize /*maximumPoolSize*/,
+        poolSize /*corePoolSize*/,
+        poolSize /*maximumPoolSize*/,
         0 /*keepAliveTime*/,
         TimeUnit.MILLISECONDS,
         new PriorityBlockingQueue<Runnable>(),
-        threadFactory);
+        new DefaultThreadFactory(name, uncaughtThrowableStrategy, preventNetworkOperations));
+    this.executeSynchronously = executeSynchronously;
+  }
+
+  @Override
+  public void execute(Runnable command) {
+    if (executeSynchronously) {
+      command.run();
+    } else {
+      super.execute(command);
+    }
+  }
+
+  @NonNull
+  @Override
+  public Future<?> submit(Runnable task) {
+    return maybeWait(super.submit(task));
+  }
+
+  private <T> Future<T> maybeWait(Future<T> future) {
+    if (executeSynchronously) {
+        try {
+        future.get();
+      } catch (InterruptedException | ExecutionException e) {
+        throw new RuntimeException(e);
+      }
+    }
+    return future;
+  }
+
+  @NonNull
+  @Override
+  public <T> Future<T> submit(Runnable task, T result) {
+    return maybeWait(super.submit(task, result));
+  }
+
+  @Override
+  public <T> Future<T> submit(Callable<T> task) {
+    return maybeWait(super.submit(task));
   }
 
   /**
@@ -159,6 +221,9 @@ public class GlideExecutor extends ThreadPoolExecutor {
       }
     };
 
+    /** The default strategy, currently {@link #LOG}. */
+    public static final UncaughtThrowableStrategy DEFAULT = LOG;
+
     protected void handle(Throwable t) {
       // Ignore.
     }
@@ -171,23 +236,14 @@ public class GlideExecutor extends ThreadPoolExecutor {
   private static final class DefaultThreadFactory implements ThreadFactory {
     private final String name;
     private final UncaughtThrowableStrategy uncaughtThrowableStrategy;
+    private final boolean preventNetworkOperations;
     private int threadNum;
 
-    DefaultThreadFactory() {
-      this(DEFAULT_NAME);
-    }
-
-    DefaultThreadFactory(String name) {
-      this(name, UncaughtThrowableStrategy.LOG);
-    }
-
-    DefaultThreadFactory(UncaughtThrowableStrategy uncaughtThrowableStrategy) {
-      this(DEFAULT_NAME, uncaughtThrowableStrategy);
-    }
-
-    DefaultThreadFactory(String name, UncaughtThrowableStrategy uncaughtThrowableStrategy) {
+    DefaultThreadFactory(String name, UncaughtThrowableStrategy uncaughtThrowableStrategy,
+        boolean preventNetworkOperations) {
       this.name = name;
       this.uncaughtThrowableStrategy = uncaughtThrowableStrategy;
+      this.preventNetworkOperations = preventNetworkOperations;
     }
 
     @Override
@@ -196,6 +252,13 @@ public class GlideExecutor extends ThreadPoolExecutor {
         @Override
         public void run() {
           android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+          if (preventNetworkOperations) {
+            StrictMode.setThreadPolicy(
+                new ThreadPolicy.Builder()
+                    .detectNetwork()
+                    .penaltyDeath()
+                    .build());
+          }
           try {
             super.run();
           } catch (Throwable t) {
